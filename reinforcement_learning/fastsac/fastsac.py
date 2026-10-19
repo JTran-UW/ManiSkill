@@ -117,6 +117,13 @@ class Args:
     algo: tyro.conf.OmitArgPrefixes[AlgoArgs] = field(default_factory=AlgoArgs)
 
 
+def track_success_keys(infos, once):
+    """OR-accumulate bool info['success_*'] (e.g. PushT2Goal-v1 success_a / success_b) over an eval rollout."""
+    for k, v in infos.items():
+        if k.startswith("success_") and isinstance(v, torch.Tensor) and v.dtype == torch.bool:
+            once[k] = once.get(k, torch.zeros_like(v)) | v
+
+
 class Logger:
     def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
         self.writer = tensorboard
@@ -354,6 +361,7 @@ if __name__ == "__main__":
         eval_obs, _ = eval_envs.reset()
         eval_metrics = defaultdict(list)
         eval_ids = []
+        eval_once = {}
         num_episodes = 0
         for _ in range(args.env.num_eval_steps):
             with torch.no_grad():
@@ -364,6 +372,7 @@ if __name__ == "__main__":
 
                 eval_actions = actor.get_action(normed_eval_obs)[0 if args.run.eval_stochastic else 2]
                 eval_next_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(eval_actions)
+                track_success_keys(eval_infos, eval_once)
 
                 real_eval_next_obs = eval_next_obs.clone()
                 if "final_info" in eval_infos:
@@ -389,6 +398,9 @@ if __name__ == "__main__":
             eval_metrics_mean[k] = mean
             if logger is not None:
                 logger.add_scalar(f"{eval_prefix}/{k}", mean, global_step)
+        if logger is not None:
+            for k, v in eval_once.items():
+                logger.add_scalar(f"{eval_prefix}/{k}_once", v.float().mean(), global_step)
         if dataset_paths and eval_ids and logger is not None and not args.env.eval_init_state_path:
             ids = torch.stack(eval_ids).flatten()
             for i, name in enumerate(dataset_names):
@@ -399,16 +411,21 @@ if __name__ == "__main__":
         if eval_default_envs is not None:
             default_obs, _ = eval_default_envs.reset()
             default_metrics = defaultdict(list)
+            default_once = {}
             for _ in range(args.env.num_eval_steps):
                 with torch.no_grad():
                     normed_default_obs = normalize_obs(default_obs, update=False) if args.algo.obs_normalization else default_obs
                     default_obs, _, _, _, default_infos = eval_default_envs.step(actor.get_action(normed_default_obs)[0 if args.run.eval_stochastic else 2])
+                    track_success_keys(default_infos, default_once)
                     if "final_info" in default_infos:
                         for k, v in default_infos["final_info"]["episode"].items():
                             default_metrics[k].append(v[default_infos["_final_info"]])
             for k, v in default_metrics.items():
                 if logger is not None:
                     logger.add_scalar(f"eval/{k}", torch.cat(v).float().mean(), global_step)
+            if logger is not None:
+                for k, v in default_once.items():
+                    logger.add_scalar(f"eval/{k}_once", v.float().mean(), global_step)
         pbar.set_description(
             f"success_once: {eval_metrics_mean['success_once']:.2f}, "
             f"return: {eval_metrics_mean['return']:.2f}"

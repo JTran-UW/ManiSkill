@@ -16,5 +16,6 @@ from .place_sphere import PlaceSphereEnv
 from .roll_ball import RollBallEnv
 from .push_t import PushTEnv
 from .push_t_goal import PushTGoalEnv
+from .push_t_2goal import PushT2GoalEnv
 from .pull_cube_tool import PullCubeToolEnv
 from .stack_pyramid import StackPyramidEnv
