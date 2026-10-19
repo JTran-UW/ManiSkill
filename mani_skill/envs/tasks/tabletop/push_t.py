@@ -421,25 +421,29 @@ class PushTEnv(BaseEnv):
         rot_mats[:, 1, 0] = alphas.sin()
         return rot_mats
 
-    def pseudo_render_intersection(self):
+    def pseudo_render_intersection(self, tee_p=None, tee_q=None, world_to_goal_trans=None):
         """'pseudo render' algo for calculating the intersection
         made custom 'psuedo renderer' to compute intersection area
         all computation in parallel on cuda, zero explicit loops
-        views blocks in 2d in the goal tee frame to see overlap"""
+        views blocks in 2d in the goal tee frame to see overlap
+        tee_p/tee_q/world_to_goal_trans default to the current tee pose and goal"""
+        tee_p = self.tee.pose.p if tee_p is None else tee_p
+        tee_q = self.tee.pose.q if tee_q is None else tee_q
+        world_to_goal_trans = self.world_to_goal_trans if world_to_goal_trans is None else world_to_goal_trans
         # we are given T_{a->w} where a == actor frame and w == world frame
         # we are given T_{g->w} where g == goal frame and w == world frame
         # applying T_{a->w} and then T_{w->g}, we get the actor's orientation in the goal tee's frame
         # T_{w->g} is T_{g->w}^{-1}, we already have the goal's orientation, and it doesn't change
         tee_to_world_trans = self.quat_to_zrot(
-            self.tee.pose.q
+            tee_q
         )  # should be (b,3,3) rot matrices
-        tee_to_world_trans[:, 0:2, 2] = self.tee.pose.p[
+        tee_to_world_trans[:, 0:2, 2] = tee_p[
             :, :2
         ]  # should be (b,3,3) rigid trans matrices
 
         # these matrices convert egocentric 3d tee to 2d goal tee frame
         tee_to_goal_trans = (
-            self.world_to_goal_trans @ tee_to_world_trans
+            world_to_goal_trans @ tee_to_world_trans
         )  # should be (b,3,3) rigid trans matrices
 
         # making homogenious coords of uv map to apply transformations to view tee in goal tee frame

@@ -1,4 +1,4 @@
-"""Load a FastSAC checkpoint as a standalone policy (actor + obs normalizer) for scripts."""
+"""Load a FastSAC or Stream-AC/PPO-pretrain checkpoint as a standalone policy (actor + obs normalizer) for scripts."""
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -36,6 +36,28 @@ def load_fastsac_policy(checkpoint: str, env, deterministic: bool = True) -> Cal
     return policy
 
 
+def load_stream_ac_policy(checkpoint: str, env, deterministic: bool = True) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Policy from a stream_ac.py / stream_ac ppo_pretrain.py checkpoint: obs -> mean or sampled action (no grad)."""
+    from reinforcement_learning.stream_ac.networks.stream_ac_actor import Actor as StreamActor
+
+    ckpt = torch.load(checkpoint, map_location="cuda", weights_only=False)
+    actor = StreamActor(env, hidden_size=ckpt["config"]["algo"]["hidden_size"]).cuda()
+    actor.load_state_dict(ckpt["actor"])
+    actor.eval()
+    normalizer = EmpiricalNormalization(shape=env.single_observation_space.shape, device="cuda")
+    normalizer.load_state_dict(ckpt["obs_normalizer"])
+    normalizer.eval()
+
+    @torch.no_grad()
+    def policy(obs: torch.Tensor) -> torch.Tensor:
+        return actor.get_action(normalizer(obs, update=False), deterministic=deterministic)
+
+    return policy
+
+
 def load_policy(checkpoint: str, env, deterministic: bool = True) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Policy from a checkpoint (FastSAC layout)."""
+    """Dispatch on checkpoint layout: stream_ac checkpoints store a state-value `critic`, FastSAC ones `qnet`/`qf1`."""
+    keys = torch.load(checkpoint, map_location="cpu", weights_only=False).keys()
+    if "critic" in keys:
+        return load_stream_ac_policy(checkpoint, env, deterministic)
     return load_fastsac_policy(checkpoint, env, deterministic)
