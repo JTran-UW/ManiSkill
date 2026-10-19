@@ -44,3 +44,9 @@ imgui.ini
 # testing
 .coverage*
 htmlcov/
+
+# my stuff
+cluster
+experts
+runs
+wandb

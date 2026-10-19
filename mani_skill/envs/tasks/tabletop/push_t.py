@@ -16,6 +16,51 @@ from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Pose
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
+# (center, half_size) of the tee's collision boxes in the tee actor frame; must match create_tee
+TEE_BOXES = (
+    ((0.0, -0.0375, 0.0), (0.1, 0.025, 0.02)),
+    ((0.0, 0.0625, 0.0), (0.025, 0.075, 0.02)),
+)
+
+
+def tee_mass_props(total_mass, ballast_pos=(0.0, 0.0), ballast_mass_ratio=0.0):
+    """Mass properties of a uniform-density tee plus a point ballast.
+
+    The ballast (ballast_mass_ratio * total_mass) sits at ballast_pos (xy, tee frame, in the tee's
+    mid-plane); the rest of total_mass is spread uniformly over the tee. Returns (mass, com,
+    diag_inertia, inertia_quat_wxyz (identity), ballast_pos) for ActorBuilder.set_mass_and_inertia.
+    """
+    if not 0.0 <= ballast_mass_ratio < 1.0:
+        raise ValueError(f"ballast_mass_ratio must be in [0, 1), got {ballast_mass_ratio}")
+    ballast_pos = np.array([ballast_pos[0], ballast_pos[1], 0.0], dtype=np.float64)
+    centers = np.array([c for c, _ in TEE_BOXES], dtype=np.float64)
+    halves = np.array([h for _, h in TEE_BOXES], dtype=np.float64)
+    vols = 8 * halves.prod(axis=1)
+    ballast_mass = ballast_mass_ratio * total_mass
+    inside = np.any(np.all(np.abs(ballast_pos - centers) <= halves + 1e-9, axis=1))
+    if ballast_mass > 0 and not inside:
+        import warnings
+
+        warnings.warn(
+            f"tee ballast at {np.round(ballast_pos, 4).tolist()} lies outside the tee geometry"
+        )
+
+    box_masses = (1.0 - ballast_mass_ratio) * total_mass * vols / vols.sum()
+    com = ((box_masses[:, None] * centers).sum(0) + ballast_mass * ballast_pos) / total_mass
+    inertia = np.zeros((3, 3))
+    for m, c, h in zip(box_masses, centers, halves):
+        a, b, t = 2 * h
+        inertia += m / 12 * np.diag([b * b + t * t, a * a + t * t, a * a + b * b])
+        d = c - com
+        inertia += m * (d @ d * np.eye(3) - np.outer(d, d))
+    d = ballast_pos - com
+    inertia += ballast_mass * (d @ d * np.eye(3) - np.outer(d, d))
+
+    # Identity inertia frame: a rotated principal frame destabilizes the GPU sim (PhysX CUDA error 700
+    # after ~1M steps). Exact for yaw/sliding since the ballast is in the mid-plane (Ixz = Iyz = 0); only
+    # the Ixy tipping coupling is dropped.
+    return float(total_mass), com, np.diag(inertia).copy(), np.array([1.0, 0.0, 0.0, 0.0]), ballast_pos
+
 
 # extending TableSceneBuilder and only making 2 changes:
 # 1.Making table smooth and white, 2. adding support for keyframes of new robots - panda stick
@@ -116,9 +161,20 @@ class PushTEnv(BaseEnv):
     T_static_friction = 3
 
     def __init__(
-        self, *args, robot_uids="panda_stick", robot_init_qpos_noise=0.02, **kwargs
+        self,
+        *args,
+        robot_uids="panda_stick",
+        robot_init_qpos_noise=0.02,
+        tee_ballast_pos_x=0.0,
+        tee_ballast_pos_y=0.0,
+        tee_ballast_mass_ratio=0.0,
+        tee_show_ballast=False,
+        **kwargs,
     ):
         self.robot_init_qpos_noise = robot_init_qpos_noise
+        self.tee_ballast_pos = (tee_ballast_pos_x, tee_ballast_pos_y)
+        self.tee_ballast_mass_ratio = tee_ballast_mass_ratio
+        self.tee_show_ballast = tee_show_ballast
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
@@ -172,7 +228,14 @@ class PushTEnv(BaseEnv):
             np.array([194, 19, 22, 255]) / 255
         )  # same as mani_skill.utils.building.actors.common - goal target
 
-        def create_tee(name="tee", target=False, base_color=TARGET_RED):
+        def create_tee(
+            name="tee",
+            target=False,
+            base_color=TARGET_RED,
+            ballast_pos=(0.0, 0.0),
+            ballast_mass_ratio=0.0,
+            show_ballast=False,
+        ):
             # dimensions of boxes that make tee
             # box2 is same as box1, except (3/4) the lenght, and rotated 90 degrees
             # these dimensions are an exact replica of the 3D tee model given by diffusion policy: https://cad.onshape.com/documents/f1140134e38f6ed6902648d5/w/a78cf81827600e4ff4058d03/e/f35f57fb7589f72e05c76caf
@@ -190,7 +253,19 @@ class PushTEnv(BaseEnv):
             first_block_pose = sapien.Pose([0.0, 0.0 - com_y, 0.0])
             first_block_size = [box1_half_w, box1_half_h, half_thickness]
             if not target:
-                builder._mass = self.T_mass
+                mass, com, inertia, inertia_quat, _ = tee_mass_props(
+                    self.T_mass, ballast_pos, ballast_mass_ratio
+                )
+                builder.set_mass_and_inertia(
+                    mass, sapien.Pose(p=com, q=inertia_quat), inertia
+                )
+                if show_ballast and ballast_mass_ratio > 0:
+                    # visual-only marker on the top face above the (mid-plane) ballast
+                    builder.add_sphere_visual(
+                        pose=sapien.Pose(p=[ballast_pos[0], ballast_pos[1], half_thickness]),
+                        radius=0.02,
+                        material=sapien.render.RenderMaterial(base_color=[0.1, 0.35, 1.0, 1.0]),
+                    )
                 tee_material = sapien.pysapien.physx.PhysxMaterial(
                     static_friction=self.T_dynamic_friction,
                     dynamic_friction=self.T_static_friction,
@@ -234,7 +309,13 @@ class PushTEnv(BaseEnv):
             else:
                 return builder.build_kinematic(name=name)
 
-        self.tee = create_tee(name="Tee", target=False)
+        self.tee = create_tee(
+            name="Tee",
+            target=False,
+            ballast_pos=self.tee_ballast_pos,
+            ballast_mass_ratio=self.tee_ballast_mass_ratio,
+            show_ballast=self.tee_show_ballast,
+        )
         self.goal_tee = create_tee(
             name="goal_Tee",
             target=True,
