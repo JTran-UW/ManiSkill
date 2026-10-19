@@ -104,8 +104,10 @@ class FlashSACEncoder(nn.Module):
         env,
         image_embed_dim=64,
         state_embed_dim=64,
+        channels_last=False,
     ):
         super().__init__()
+        self.channels_last = channels_last
         k, image_size, _, C = env.single_observation_space["rgb"].shape
         in_channels = k * C
         assert image_size % 32 == 0, image_size
@@ -124,8 +126,11 @@ class FlashSACEncoder(nn.Module):
     def forward(self, x):
         x_rgb = x["rgb"]
         B, k, H, W, C = x_rgb.shape
-        x_rgb = x_rgb.permute(0, 1, 4, 2, 3)
-        x_rgb = x_rgb.reshape(B, k * C, H, W)
+        if self.channels_last:
+            x_rgb = x_rgb.permute(0, 2, 3, 1, 4).reshape(B, H, W, k * C).permute(0, 3, 1, 2)
+        else:
+            x_rgb = x_rgb.permute(0, 1, 4, 2, 3)
+            x_rgb = x_rgb.reshape(B, k * C, H, W)
         x_rgb = x_rgb.float().div_(255.0)
         x_state = x["state"]
         if x_state.dim() == 3:
